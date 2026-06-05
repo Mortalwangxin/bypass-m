@@ -1,0 +1,20 @@
+name: Build dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          make
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bypass-dylib
+          path: bypass.dylib
