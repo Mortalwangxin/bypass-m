@@ -1,12 +1,13 @@
 ARCH = arm64
 CC = clang
-CFLAGS = -arch $(ARCH) -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) -F/System/Library/Frameworks -framework Foundation -O2
+SDK = $(shell xcrun --sdk iphoneos --show-sdk-path)
+CFLAGS = -arch $(ARCH) -isysroot $(SDK) -F$(SDK)/System/Library/Frameworks -framework Foundation -O2
 LDFLAGS = -dynamiclib -install_name @rpath/bypass.dylib
 
 all: bypass.dylib
 
 bypass.dylib: bypass.o fishhook.o
-	$(CC) $(CFLAGS) -Xlinker $(LDFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
 
 bypass.o: bypass.m fishhook.h
 	$(CC) $(CFLAGS) -c bypass.m
