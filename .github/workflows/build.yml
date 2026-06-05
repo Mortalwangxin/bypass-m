@@ -22,11 +22,11 @@ jobs:
             -miphoneos-version-min=14.0 \
             -isysroot "$SDK" \
             -o MTPlugin.dylib \
-            MTPlugin_v5.c \
+            MTPlugin.m \
+            fishhook.c \
             -fobjc-arc \
             -Wno-deprecated-declarations
 
-          # 签名
           codesign -f -s - MTPlugin.dylib || true
 
       - name: Upload artifact
