@@ -16,7 +16,12 @@
 #include <stdlib.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
-
+#include <dlfcn.h>
+#include <dispatch/dispatch.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
+#include <mach/mach.h>
+#include <unistd.h>   // for getpagesize()
 // ============================================================================
 // libdispatch (extern 澹版槑锛岄伩鍏嶅ご鏂囦欢渚濊禆)
 // ============================================================================
@@ -136,7 +141,7 @@ static struct rebindings_entry *_rebindings_head = 0;
  */
 static void make_segment_writable(void *addr, size_t size) {
     mach_port_t task = mach_task_self();
-    vm_address_t page = (vm_address_t)addr & ~(vm_page_size - 1);
+    vm_address_t page = (vm_address_t)addr & ~(getpagesize() - 1);
     vm_protect(task, page, size + ((vm_address_t)addr - page), 0, VM_PROT_READ | VM_PROT_WRITE);
 }
 
