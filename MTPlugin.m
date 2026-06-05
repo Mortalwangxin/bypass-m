@@ -1,13 +1,14 @@
 /*
- * MTPlugin.m - i茅台抢购插件
+ * MTPlugin.m - i茅台抢购插件 (修复闪退版)
  *
  * 目标: i茅台 (com.moutai.mall) v1.9.7
  * 注入: TrollFools
  *
- * 功能:
- *   1. fishhook CFNetworkCopySystemProxySettings → 绕过代理/VPN 检测
- *   2. hook yx_headerEncryptString              → 绕过注入检测
- *   3. hook addScriptMessageHandler:name:       → WebView JS 注入
+ * 修复:
+ *   - addScriptMessageHandler:name: 返回 void，hook 必须匹配
+ *   - IMP 调用时强转为正确的函数指针类型
+ *   - yx_headerEncryptString 延迟 hook，等 category 加载完成
+ *   - fishhook 延迟执行避免 dyld 重入
  *
  * 编译 (GitHub Actions macOS runner):
  *   SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -26,21 +27,33 @@
 #import "fishhook.h"
 
 // ============================================================================
-// 1. 绕过代理/VPN 检测
+// 1. 绕过代理/VPN 检测 (fishhook CFNetworkCopySystemProxySettings)
 // ============================================================================
 
 static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void);
 
 static CFDictionaryRef my_CFNetworkCopySystemProxySettings(void) {
-    if (!orig_CFNetworkCopySystemProxySettings) return NULL;
-    CFDictionaryRef orig = orig_CFNetworkCopySystemProxySettings();
-    if (!orig) return orig;
-    // 返回空字典 → app 认为没有代理配置
-    return (__bridge_retained CFDictionaryRef)[NSMutableDictionary dictionary];
+    // 直接返回空字典，app 认为没有代理配置
+    // 用 __bridge 而非 __bridge_retained，避免内存泄漏
+    return (__bridge CFDictionaryRef)[NSDictionary dictionary];
+}
+
+static void do_fishhook_proxy(void *ctx) {
+    (void)ctx;
+    struct rebinding r = {
+        "CFNetworkCopySystemProxySettings",
+        (void *)my_CFNetworkCopySystemProxySettings,
+        (void **)&orig_CFNetworkCopySystemProxySettings
+    };
+    rebind_symbols(&r, 1);
+    NSLog(@"[MTPlugin] 代理检测绕过已启用");
 }
 
 // ============================================================================
 // 2. 绕过注入检测 - hook yx_headerEncryptString
+//
+// 这是 NSString 的 category 方法，dylib 加载时可能还没注册。
+// 延迟 2 秒再 hook，确保 category 已经加载到 runtime。
 // ============================================================================
 
 static id (*orig_yx_headerEncryptString)(id self, SEL _cmd);
@@ -50,8 +63,25 @@ static id fake_yx_headerEncryptString(id self, SEL _cmd) {
     return @"root/0;debug/0;proxy/0;inject/0";
 }
 
+static void do_hook_encrypt(void *ctx) {
+    (void)ctx;
+    Method encMethod = class_getInstanceMethod(
+        [NSString class], NSSelectorFromString(@"yx_headerEncryptString"));
+    if (encMethod) {
+        orig_yx_headerEncryptString = (void *)method_getImplementation(encMethod);
+        method_setImplementation(encMethod, (IMP)fake_yx_headerEncryptString);
+        NSLog(@"[MTPlugin] 注入检测绕过已启用");
+    } else {
+        NSLog(@"[MTPlugin] yx_headerEncryptString 未找到，跳过");
+    }
+}
+
 // ============================================================================
-// 3. WebView JS 注入 - 拦截 fetch 请求
+// 3. WebView JS 注入 - hook addScriptMessageHandler:name:
+//
+// !! 关键修复 !!
+// addScriptMessageHandler:name: 返回 void，不是 id。
+// hook 函数和函数指针都必须匹配 void 返回类型。
 // ============================================================================
 
 static NSString *getInjectionJS(void) {
@@ -93,9 +123,11 @@ static NSString *getInjectionJS(void) {
     return js;
 }
 
-static IMP orig_addScriptMessageHandler = NULL;
+// 原始方法的函数指针 - 注意返回 void！
+static void (*orig_addScriptMessageHandler)(id self, SEL _cmd, id handler, id name);
 
-static id fake_addScriptMessageHandler(id self, SEL _cmd, id handler, id name) {
+// hook 函数 - 返回 void，和原始方法一致
+static void fake_addScriptMessageHandler(id self, SEL _cmd, id handler, id name) {
     // 注入 JS 脚本到 WebView
     WKUserScript *script = [[WKUserScript alloc]
         initWithSource:getInjectionJS()
@@ -104,57 +136,54 @@ static id fake_addScriptMessageHandler(id self, SEL _cmd, id handler, id name) {
     [(WKUserContentController *)self addUserScript:script];
 
     // 调用原始实现
-    return ((id (*)(id, SEL, id, id))orig_addScriptMessageHandler)(self, _cmd, handler, name);
+    orig_addScriptMessageHandler(self, _cmd, handler, name);
+}
+
+static void do_hook_webview(void *ctx) {
+    (void)ctx;
+    Method addMethod = class_getInstanceMethod(
+        NSClassFromString(@"WKUserContentController"),
+        NSSelectorFromString(@"addScriptMessageHandler:name:"));
+    if (addMethod) {
+        orig_addScriptMessageHandler = (void *)method_getImplementation(addMethod);
+        method_setImplementation(addMethod, (IMP)fake_addScriptMessageHandler);
+        NSLog(@"[MTPlugin] WebView JS注入已启用");
+    } else {
+        NSLog(@"[MTPlugin] addScriptMessageHandler:name: 未找到");
+    }
 }
 
 // ============================================================================
 // 4. 入口 (constructor)
 //
-// constructor 中不能调用 dlopen/dlsym (会触发 dyld 重入崩溃)。
+// constructor 中不能调用 dlopen/dlsym (dyld 重入崩溃)。
 // ObjC runtime 函数 (objc_getClass 等) 可以安全调用。
-// fishhook 通过 dispatch_after_f 延迟 1 秒执行。
+// 所有 hook 都通过 dispatch_after_f 延迟执行：
+//   - fishhook: 延迟 1 秒
+//   - yx_headerEncryptString: 延迟 2 秒 (等 category 注册)
+//   - addScriptMessageHandler: 延迟 2 秒
 // ============================================================================
-
-static void delayed_fishhook_init(void *ctx) {
-    (void)ctx;
-    struct rebinding r = {
-        "CFNetworkCopySystemProxySettings",
-        (void *)my_CFNetworkCopySystemProxySettings,
-        (void **)&orig_CFNetworkCopySystemProxySettings
-    };
-    rebind_symbols(&r, 1);
-    NSLog(@"[MTPlugin] 代理检测绕过已启用");
-}
 
 __attribute__((constructor))
 static void mt_plugin_init(void) {
     @autoreleasepool {
-        NSLog(@"[MTPlugin] 茅台抢购插件已加载");
+        NSLog(@"[MTPlugin] 茅台抢购插件已加载，开始延迟初始化...");
 
-        // 1. fishhook: 延迟绕过代理检测
+        // 1. fishhook: 延迟 1 秒绕过代理检测
         dispatch_after_f(
             dispatch_time(DISPATCH_TIME_NOW, (long long)(1.0 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), NULL, delayed_fishhook_init);
+            dispatch_get_main_queue(), NULL, do_fishhook_proxy);
 
-        // 2. hook yx_headerEncryptString: 绕过注入检测
-        Method encMethod = class_getInstanceMethod(
-            [NSString class], NSSelectorFromString(@"yx_headerEncryptString"));
-        if (encMethod) {
-            orig_yx_headerEncryptString = (void *)method_getImplementation(encMethod);
-            method_setImplementation(encMethod, (IMP)fake_yx_headerEncryptString);
-            NSLog(@"[MTPlugin] 注入检测绕过已启用");
-        }
+        // 2. hook yx_headerEncryptString: 延迟 2 秒，等 category 加载
+        dispatch_after_f(
+            dispatch_time(DISPATCH_TIME_NOW, (long long)(2.0 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), NULL, do_hook_encrypt);
 
-        // 3. hook addScriptMessageHandler:name:: WebView JS 注入
-        Method addMethod = class_getInstanceMethod(
-            NSClassFromString(@"WKUserContentController"),
-            NSSelectorFromString(@"addScriptMessageHandler:name:"));
-        if (addMethod) {
-            orig_addScriptMessageHandler = method_getImplementation(addMethod);
-            method_setImplementation(addMethod, (IMP)fake_addScriptMessageHandler);
-            NSLog(@"[MTPlugin] WebView JS注入已启用");
-        }
+        // 3. hook addScriptMessageHandler:name:: 延迟 2 秒
+        dispatch_after_f(
+            dispatch_time(DISPATCH_TIME_NOW, (long long)(2.0 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), NULL, do_hook_webview);
 
-        NSLog(@"[MTPlugin] 所有Hook就绪");
+        NSLog(@"[MTPlugin] 延迟任务已安排");
     }
 }
