@@ -1,4 +1,4 @@
-name: Build MTPlugin.dylib (诊断版)
+name: Build MTPlugin.dylib
 
 on:
   push:
@@ -11,16 +11,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build dylib (诊断版 - 无 hook)
+      - name: Build dylib
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           clang -dynamiclib \
             -framework Foundation \
+            -framework UIKit \
+            -framework WebKit \
             -arch arm64 \
             -miphoneos-version-min=14.0 \
             -isysroot "$SDK" \
             -o MTPlugin.dylib \
             MTPlugin.m \
+            fishhook.c \
             -fobjc-arc \
             -Wno-deprecated-declarations
 
