@@ -1,205 +1,26 @@
 /*
- * MTPlugin.m - i茅台抢购插件 (修复闪退版 v2)
+ * MTPlugin.m - 诊断版 v3 (逐步排查闪退)
  *
- * 目标: i茅台 (com.moutai.mall) v1.9.7
- * 注入: TrollFools
- *
- * 闪退根因:
- *   addScriptMessageHandler:name: 返回 void，但旧代码 hook 声明返回 id。
- *   调用者读 x0 寄存器拿"返回值"→ 拿到垃圾 → 崩溃。
- *
- * 修复:
- *   1. hook 函数返回 void，函数指针类型 void(*)(id,SEL,id,id)
- *   2. yx_headerEncryptString category 加载重试机制
- *   3. fishhook 延迟避免 dyld 重入
- *   4. __bridge 替代 __bridge_retained 避免内存泄漏
- *
- * 编译 (GitHub Actions macOS runner):
- *   SDK=$(xcrun --sdk iphoneos --show-sdk-path)
- *   clang -dynamiclib -arch arm64 -miphoneos-version-min=14.0 \
- *         -isysroot "$SDK" -framework Foundation -framework UIKit \
- *         -framework WebKit -o MTPlugin.dylib MTPlugin.m fishhook.c \
- *         -fobjc-arc -Wno-deprecated-declarations
+ * 策略: 先只加日志，不加任何 hook。
+ * 如果这个版本也闪退 → 说明是 dylib 本身的问题（签名/链接/架构）
+ * 如果不闪退 → 逐步开启 hook 定位具体是哪个
  */
 
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
-#import <WebKit/WebKit.h>
-#import <mach-o/dyld.h>
-#import <dlfcn.h>
-#import <objc/runtime.h>
-#import "fishhook.h"
 
-// ============================================================================
-// 1. 绕过代理/VPN 检测 (fishhook CFNetworkCopySystemProxySettings)
-// ============================================================================
-
-static CFDictionaryRef (*orig_CFNetworkCopySystemProxySettings)(void);
-
-static CFDictionaryRef my_CFNetworkCopySystemProxySettings(void) {
-    // 返回空字典 → app 认为没有代理配置
-    return (__bridge CFDictionaryRef)[NSDictionary dictionary];
-}
-
-static void do_fishhook_proxy(void *ctx) {
+static void delayed_log(void *ctx) {
     (void)ctx;
-    struct rebinding r = {
-        "CFNetworkCopySystemProxySettings",
-        (void *)my_CFNetworkCopySystemProxySettings,
-        (void **)&orig_CFNetworkCopySystemProxySettings
-    };
-    rebind_symbols(&r, 1);
-    NSLog(@"[MTPlugin] 代理检测绕过已启用");
+    NSLog(@"[MTPlugin] ✅ dispatch_after_f 1秒回调正常");
 }
-
-// ============================================================================
-// 2. 绕过注入检测 - hook yx_headerEncryptString
-//
-// NSString 的 category 方法，dylib 加载时可能还没注册到 runtime。
-// 用重试机制：每 0.5 秒检查一次，最多重试 10 次 (5 秒)。
-// ============================================================================
-
-static id (*orig_yx_headerEncryptString)(id self, SEL _cmd);
-
-static id fake_yx_headerEncryptString(id self, SEL _cmd) {
-    return @"root/0;debug/0;proxy/0;inject/0";
-}
-
-static int _yx_hook_attempts = 0;
-
-static void do_hook_encrypt(void *ctx) {
-    (void)ctx;
-
-    Method encMethod = class_getInstanceMethod(
-        [NSString class], NSSelectorFromString(@"yx_headerEncryptString"));
-
-    if (encMethod) {
-        orig_yx_headerEncryptString = (void *)method_getImplementation(encMethod);
-        method_setImplementation(encMethod, (IMP)fake_yx_headerEncryptString);
-        NSLog(@"[MTPlugin] 注入检测绕过已启用 (第%d次尝试)", _yx_hook_attempts + 1);
-        return;
-    }
-
-    // category 还没加载，重试
-    _yx_hook_attempts++;
-    if (_yx_hook_attempts < 10) {
-        NSLog(@"[MTPlugin] yx_headerEncryptString 未找到，0.5秒后重试 (%d/10)", _yx_hook_attempts);
-        dispatch_after_f(
-            dispatch_time(DISPATCH_TIME_NOW, (long long)(0.5 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), NULL, do_hook_encrypt);
-    } else {
-        NSLog(@"[MTPlugin] ⚠️ yx_headerEncryptString 10次重试均失败，跳过");
-    }
-}
-
-// ============================================================================
-// 3. WebView JS 注入 - hook addScriptMessageHandler:name:
-//
-// !! 关键修复 !!
-// addScriptMessageHandler:name: 返回 void，不是 id。
-// hook 函数和函数指针必须匹配 void 返回类型。
-// 旧代码声明返回 id → 调用者读 x0 拿到垃圾值 → 闪退。
-// ============================================================================
-
-static NSString *getInjectionJS(void) {
-    static NSString *js = nil;
-    if (js) return js;
-
-    js = @"(function(){"
-    "var o=window.fetch;"
-    "window.fetch=function(i,n){"
-    "return o.apply(this,[i,n]).then(function(r){"
-    "return r.clone().text().then(function(t){"
-    "var x=t;try{"
-    "var j=JSON.parse(t);"
-    "if(j.data&&j.data.itemId==='IMTP1000313'&&"
-    "((j.data.purchaseInfoMap&&Object.keys(j.data.purchaseInfoMap).length===0)"
-    "||j.data.forbiddenBuyDesc)){"
-    "x=JSON.stringify({code:2000,data:{itemId:'IMTP1000313',offline:false,"
-    "purchaseInfoMap:{'1001017':{defaultSkuFlag:true,"
-    "purchaseInfo:{skuId:'741',inventory:12,presellInventory:12,canAddCart:false,"
-    "limitCount:6,inDeliveryArea:true,showSelfPickUpBtn:false,disable:false,"
-    "defaultSkuFlag:false}}},showSaleUnit:true,nationWide:false}});}"
-    "else if(j.data&&j.data.purchaseInfoMap){"
-    "var m=j.data.purchaseInfoMap;Object.keys(m).forEach(function(k){"
-    "var p=m[k]&&m[k].purchaseInfo;if(!p)return;"
-    "if('forbiddenBuyDesc' in p)delete p.forbiddenBuyDesc;"
-    "p.inventory=12;p.presellInventory=12;});x=JSON.stringify(j);}"
-    "else if(j===2||(j.code&&(j.code===4293||j.code===4030||j.code===4031))){"
-    "var h=new Headers(n&&n.headers||{});h.set('MT-K',Date.now().toString());"
-    "return o.call(this,i,{...(n||{}),headers:h}).then(function(r2){"
-    "return r2.clone().text().then(function(t2){"
-    "return new Response(t2,{status:r2.status,statusText:r2.statusText,"
-    "headers:r2.headers});});});}"
-    "}catch(e){}"
-    "return new Response(x,{status:r.status,statusText:r.statusText,"
-    "headers:r.headers});"
-    "});});};"
-    "})();";
-
-    return js;
-}
-
-// 原始方法的函数指针 — 返回 void
-static void (*orig_addScriptMessageHandler)(id self, SEL _cmd, id handler, id name);
-
-// hook 函数 — 返回 void，和原始方法签名一致
-static void fake_addScriptMessageHandler(id self, SEL _cmd, id handler, id name) {
-    // 注入 JS 脚本到 WebView
-    WKUserScript *script = [[WKUserScript alloc]
-        initWithSource:getInjectionJS()
-        injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-        forMainFrameOnly:NO];
-    [(WKUserContentController *)self addUserScript:script];
-
-    // 调用原始实现
-    if (orig_addScriptMessageHandler) {
-        orig_addScriptMessageHandler(self, _cmd, handler, name);
-    }
-}
-
-static void do_hook_webview(void *ctx) {
-    (void)ctx;
-    Method addMethod = class_getInstanceMethod(
-        NSClassFromString(@"WKUserContentController"),
-        NSSelectorFromString(@"addScriptMessageHandler:name:"));
-    if (addMethod) {
-        orig_addScriptMessageHandler = (void *)method_getImplementation(addMethod);
-        method_setImplementation(addMethod, (IMP)fake_addScriptMessageHandler);
-        NSLog(@"[MTPlugin] WebView JS注入已启用");
-    } else {
-        NSLog(@"[MTPlugin] ⚠️ addScriptMessageHandler:name: 未找到");
-    }
-}
-
-// ============================================================================
-// 4. 入口 (constructor)
-//
-// constructor 中不能调用 dlopen/dlsym (dyld 重入崩溃)。
-// ObjC runtime 函数 (class_getInstanceMethod 等) 可以安全调用。
-// 所有 hook 通过 dispatch_after_f 延迟执行。
-// ============================================================================
 
 __attribute__((constructor))
 static void mt_plugin_init(void) {
-    @autoreleasepool {
-        NSLog(@"[MTPlugin] 茅台抢购插件已加载，开始延迟初始化...");
+    NSLog(@"[MTPlugin] ✅ dylib 加载成功，constructor 执行");
 
-        // 1. fishhook: 延迟 1 秒绕过代理检测
-        dispatch_after_f(
-            dispatch_time(DISPATCH_TIME_NOW, (long long)(1.0 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), NULL, do_fishhook_proxy);
+    // 测试 dispatch_after_f 是否正常
+    dispatch_after_f(
+        dispatch_time(DISPATCH_TIME_NOW, (long long)(1.0 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), NULL, delayed_log);
 
-        // 2. hook yx_headerEncryptString: 延迟 1 秒开始，失败则重试
-        dispatch_after_f(
-            dispatch_time(DISPATCH_TIME_NOW, (long long)(1.0 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), NULL, do_hook_encrypt);
-
-        // 3. hook addScriptMessageHandler:name:: 延迟 2 秒
-        dispatch_after_f(
-            dispatch_time(DISPATCH_TIME_NOW, (long long)(2.0 * NSEC_PER_SEC)),
-            dispatch_get_main_queue(), NULL, do_hook_webview);
-
-        NSLog(@"[MTPlugin] 延迟任务已安排");
-    }
+    NSLog(@"[MTPlugin] ✅ 延迟任务已安排");
 }
